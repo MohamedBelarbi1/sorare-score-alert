@@ -36,7 +36,7 @@ TWITTER_ACCESS_TOKEN = os.environ["TWITTER_ACCESS_TOKEN"]
 TWITTER_ACCESS_TOKEN_SECRET = os.environ["TWITTER_ACCESS_TOKEN_SECRET"]
 
 POLL_INTERVAL_SECONDS = 15 * 60
-SCORE_THRESHOLD = 50
+SCORE_THRESHOLD = 70
 
 # ---------------------------------------------------------------------------
 # GraphQL helpers
