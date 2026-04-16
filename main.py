@@ -136,24 +136,10 @@ def fetch_current_fixture_slug(headers):
           }
         }
         """),
-        # Tentative 3 : so5 > fixtures (liste)
-        ("so5.fixtures", """
+        # Tentative 3 : so5 > so5Fixtures (liste)
+        ("so5.so5Fixtures", """
         query {
           so5 {
-            fixtures(first: 1) {
-              nodes {
-                slug
-                gameWeek
-                displayName
-              }
-            }
-          }
-        }
-        """),
-        # Tentative 4 : football > so5Fixtures
-        ("football.so5Fixtures", """
-        query {
-          football {
             so5Fixtures(first: 1) {
               nodes {
                 slug
@@ -191,23 +177,11 @@ def fetch_current_fixture_slug(headers):
             d = data.get("data", {})
             fixture = None
 
-            # Chemin so5.currentFixture ou football.currentFixture
-            for root_key in ["so5", "football"]:
-                root = d.get(root_key, {})
-                if not root:
-                    continue
-                # currentFixture direct
-                if root.get("currentFixture"):
-                    fixture = root["currentFixture"]
-                    break
-                # fixtures.nodes[0]
-                if root.get("fixtures", {}).get("nodes"):
-                    fixture = root["fixtures"]["nodes"][0]
-                    break
-                # so5Fixtures.nodes[0]
-                if root.get("so5Fixtures", {}).get("nodes"):
-                    fixture = root["so5Fixtures"]["nodes"][0]
-                    break
+            root = d.get("so5", {})
+            if root.get("currentFixture"):
+                fixture = root["currentFixture"]
+            elif root.get("so5Fixtures", {}).get("nodes"):
+                fixture = root["so5Fixtures"]["nodes"][0]
 
             if fixture and fixture.get("slug"):
                 slug = fixture["slug"]
@@ -230,29 +204,10 @@ def fetch_scores_for_fixture(fixture_slug, headers):
     On utilise so5Fixture(slug) imbriqué dans so5 {}.
     """
     queries_to_try = [
-        # Tentative 1 : so5 > fixture(slug)
-        ("so5.fixture", """
+        # Tentative 1 : so5 > so5Fixture(slug)
+        ("so5.so5Fixture", """
         query GetScores($slug: String!, $minScore: Int!) {
           so5 {
-            fixture(slug: $slug) {
-              slug
-              displayName
-              orderedSo5ScoresByPosition(first: 50, minScore: $minScore) {
-                nodes {
-                  score
-                  player {
-                    displayName
-                  }
-                }
-              }
-            }
-          }
-        }
-        """),
-        # Tentative 2 : football > so5Fixture(slug)
-        ("football.so5Fixture", """
-        query GetScores($slug: String!, $minScore: Int!) {
-          football {
             so5Fixture(slug: $slug) {
               slug
               displayName
@@ -297,17 +252,12 @@ def fetch_scores_for_fixture(fixture_slug, headers):
                     print(f"   ⚠️  [{name}] {err.get('message', str(err))[:120]}")
                 continue
 
-            # Cherche les données dans so5 ou football
+            # Cherche les données dans so5
             d = data.get("data", {})
             fixture_data = None
-            for root_key in ["so5", "football"]:
-                root = d.get(root_key, {})
-                if root.get("fixture"):
-                    fixture_data = root["fixture"]
-                    break
-                if root.get("so5Fixture"):
-                    fixture_data = root["so5Fixture"]
-                    break
+            root = d.get("so5", {})
+            if root.get("so5Fixture"):
+                fixture_data = root["so5Fixture"]
 
             if not fixture_data:
                 continue
