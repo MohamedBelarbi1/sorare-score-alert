@@ -1,338 +1,342 @@
 """
-Sorare Score Monitor
---------------------
-Polls the Sorare GraphQL API every 15 minutes for the current fixture's
-player scores. When any player reaches 100+ points in a game, posts a
-tweet via the Twitter/X API.
+Sorare Score Alert Bot
+======================
+Ce script surveille l'API Sorare et poste automatiquement sur X (Twitter)
+quand un joueur obtient un score >= TARGET_SCORE.
 
-Run:
-    python3 main.py
+Stratégie API : requêtes légères sur les derniers games pour rester
+sous la limite de complexité GraphQL de l'API publique Sorare (500 points).
+
+CONFIGURATION :
+  - Les clés API sont lues depuis les variables d'environnement Railway/Replit
+  - Lance le script : python main.py
 """
 
-import os
-import time
-import logging
 import requests
 import tweepy
+import json
+import time
+import os
+import random
+import unicodedata
+from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+# ============================================================
+# CONFIG — Chargée depuis les variables d'environnement
+# ============================================================
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# Clés X (Twitter) — définies dans Railway > Variables
+X_API_KEY             = os.environ.get("X_API_KEY", "")
+X_API_SECRET          = os.environ.get("X_API_SECRET", "")
+X_ACCESS_TOKEN        = os.environ.get("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET", "")
+
+# Clé API Sorare (optionnelle — monte la limite de complexité à 30 000)
+# Pour en obtenir une : https://docs.sorare.com/docs/authentication
+SORARE_API_KEY = os.environ.get("SORARE_API_KEY", "")
+
+# Fréquence de vérification en secondes (900 = 15 minutes)
+CHECK_INTERVAL = 900
+
+# Score cible à détecter
+TARGET_SCORE = int(os.environ.get("TARGET_SCORE", "100"))
+
+# Fichier pour mémoriser les scores déjà tweetés (évite les doublons)
+ALREADY_POSTED_FILE = "already_posted.json"
+
+# URL de l'API Sorare
 SORARE_GRAPHQL_URL = "https://api.sorare.com/graphql"
 
-TWITTER_API_KEY = os.environ["TWITTER_API_KEY"]
-TWITTER_API_SECRET = os.environ["TWITTER_API_SECRET"]
-TWITTER_ACCESS_TOKEN = os.environ["TWITTER_ACCESS_TOKEN"]
-TWITTER_ACCESS_TOKEN_SECRET = os.environ["TWITTER_ACCESS_TOKEN_SECRET"]
+# ============================================================
+# TEMPLATES DE TWEETS
+# Variables disponibles : {player}, {score}, {competition}, {player_hashtag}
+# ============================================================
 
-POLL_INTERVAL_SECONDS = 15 * 60
-SCORE_THRESHOLD = 70
+TWEET_TEMPLATES = [
+    "🔥 PERFECT SCORE! {player} just hit {score} on @SorareHQ in {competition}! 🌟 #Sorare #Score100 #{player_hashtag}",
+    "💯 {player} scores PERFECT {score} on @SorareHQ! Incredible performance in {competition}! 🚀 #Sorare #PerfectScore",
+    "🎯 Perfect 100 alert! {player} just delivered a flawless performance on @SorareHQ ({competition}) ⚽ #Sorare #Score100",
+    "⭐ {player} = absolute GOAT mode! {score}/100 on @SorareHQ in {competition} 🤩 #Sorare #{player_hashtag}",
+]
 
-# ---------------------------------------------------------------------------
-# GraphQL helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# FONCTIONS UTILITAIRES
+# ============================================================
 
-FIXTURES_SLUGS_QUERY = """
-query GetRecentFixtureSlugs {
-  so5 {
-    so5Fixtures(first: 3) {
-      nodes {
-        id
-        slug
-        gameWeek
+def load_already_posted():
+    """Charge la liste des scores déjà tweetés pour éviter les doublons."""
+    if os.path.exists(ALREADY_POSTED_FILE):
+        with open(ALREADY_POSTED_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_already_posted(posted_set):
+    """Sauvegarde la liste des scores déjà tweetés."""
+    with open(ALREADY_POSTED_FILE, "w") as f:
+        json.dump(list(posted_set), f, indent=2)
+
+def make_player_hashtag(player_name):
+    """Transforme un nom de joueur en hashtag (ex: 'Kylian Mbappé' -> 'KylianMbappe')."""
+    name = unicodedata.normalize('NFD', player_name)
+    name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
+    return name.replace(' ', '').replace('-', '').replace("'", "")
+
+def build_headers():
+    """Construit les headers HTTP pour l'API Sorare."""
+    headers = {"Content-Type": "application/json"}
+    if SORARE_API_KEY:
+        headers["APIKEY"] = SORARE_API_KEY
+        print("   🔑 Utilisation de la clé API Sorare (limite 30 000)")
+    else:
+        print("   ⚠️  Pas de clé API Sorare (limite 500 — requêtes simplifiées)")
+    return headers
+
+# ============================================================
+# CONNEXION À L'API X (TWITTER)
+# ============================================================
+
+def get_twitter_client():
+    """Initialise le client X (Twitter) avec tes clés."""
+    if not all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]):
+        print("❌ Clés X (Twitter) manquantes ! Vérifie tes variables d'environnement Railway.")
+        return None
+    client = tweepy.Client(
+        consumer_key=X_API_KEY,
+        consumer_secret=X_API_SECRET,
+        access_token=X_ACCESS_TOKEN,
+        access_token_secret=X_ACCESS_TOKEN_SECRET
+    )
+    return client
+
+def post_tweet(client, message):
+    """Poste un tweet."""
+    if client is None:
+        print("   ❌ Client Twitter non initialisé, tweet ignoré")
+        return False
+    try:
+        response = client.create_tweet(text=message)
+        print(f"   ✅ Tweet posté ! ID: {response.data['id']}")
+        return True
+    except tweepy.TweepyException as e:
+        print(f"   ❌ Erreur Twitter : {e}")
+        return False
+
+# ============================================================
+# RÉCUPÉRATION DES SCORES VIA L'API SORARE
+# Stratégie : requête légère sur les fixtures récentes puis
+# requête séparée par fixture pour les scores (évite explosion complexité)
+# ============================================================
+
+def fetch_current_fixture_slug(headers):
+    """
+    Récupère le slug de la fixture la plus récente.
+    Requête très légère (~30 points de complexité).
+    """
+    query = """
+    query GetCurrentFixture {
+      so5Fixtures(first: 1) {
+        nodes {
+          slug
+          gameWeek
+          startDate
+          endDate
+        }
       }
     }
-  }
-}
-"""
-
-FIXTURE_GAMES_QUERY = """
-query GetFixtureGames($slug: String!) {
-  so5 {
-    so5Fixture(slug: $slug) {
-      id
-      slug
-      gameWeek
-      games {
-        id
-        homeTeam { name }
-        awayTeam { name }
-      }
-    }
-  }
-}
-"""
-
-PLAYERS_QUERY = """
-query GetGamePlayers($gameId: ID!) {
-  football {
-    game(id: $gameId) {
-      players {
-        slug
-        displayName
-        position
-      }
-    }
-  }
-}
-"""
-
-def gql(query: str, variables: dict = None) -> dict:
-    """Execute a GraphQL query and return parsed JSON data."""
-    payload = {"query": query}
-    if variables:
-        payload["variables"] = variables
-
+    """
     try:
         resp = requests.post(
             SORARE_GRAPHQL_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
+            json={"query": query},
+            headers=headers,
+            timeout=30
         )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.error("HTTP error calling Sorare API: %s", exc)
-        return {}
+        data = resp.json()
 
-    data = resp.json()
-    if "errors" in data:
-        for err in data["errors"]:
-            logger.error("Sorare GraphQL error: %s", err.get("message"))
-        return {}
+        if "errors" in data:
+            for err in data["errors"]:
+                print(f"   ⚠️  Erreur GraphQL : {err.get('message', err)}")
+            return None
 
-    return data.get("data", {})
+        nodes = data.get("data", {}).get("so5Fixtures", {}).get("nodes", [])
+        if nodes:
+            fixture = nodes[0]
+            print(f"   Fixture en cours : {fixture['slug']} (GW{fixture['gameWeek']})")
+            return fixture["slug"]
+        return None
+
+    except Exception as e:
+        print(f"   ❌ Erreur réseau : {e}")
+        return None
 
 
-def fetch_recent_fixtures() -> list:
+def fetch_scores_for_fixture(fixture_slug, headers):
     """
-    Return the most recent so5Fixtures with their games.
-    Sorare does not allow selecting 'games' inside a fixture list,
-    so we first fetch fixture slugs, then each fixture individually.
+    Récupère les scores pour une fixture donnée.
+    On pagine sur les leaderboards avec first:3 pour rester sous 500 points.
     """
-    data = gql(FIXTURES_SLUGS_QUERY)
+    # Requête simplifiée : seulement 3 leaderboards, 20 rankings max
+    query = """
+    query GetFixtureScores($slug: String!) {
+      so5Fixture(slug: $slug) {
+        slug
+        so5Leaderboards(first: 3) {
+          nodes {
+            displayName
+            so5Rankings(first: 20) {
+              nodes {
+                so5Lineup {
+                  so5AppearanceProjections {
+                    score
+                    player {
+                      displayName
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
     try:
-        stubs = data["so5"]["so5Fixtures"]["nodes"]
-    except (KeyError, TypeError):
-        logger.error("Could not parse fixture slugs from Sorare response.")
-        return []
-
-    fixtures = []
-    for stub in stubs[:2]:  # Only check the two most recent
-        slug = stub["slug"]
-        fixture_data = gql(FIXTURE_GAMES_QUERY, {"slug": slug})
-        try:
-            fixture = fixture_data["so5"]["so5Fixture"]
-            fixtures.append(fixture)
-        except (KeyError, TypeError):
-            logger.warning("Could not fetch games for fixture: %s", slug)
-
-    return fixtures
-
-
-def fetch_players_for_game(game_id: str) -> list:
-    """Return list of {slug, displayName, position} for a game."""
-    # The football.game field expects a bare UUID, not the prefixed "Game:<uuid>" form
-    raw_id = game_id.split(":")[-1] if ":" in game_id else game_id
-    data = gql(PLAYERS_QUERY, {"gameId": raw_id})
-    try:
-        return data["football"]["game"]["players"]
-    except (KeyError, TypeError):
-        return []
-
-
-def build_score_query(fixture_slug: str, game_id: str, players: list) -> str:
-    """
-    Build a GraphQL query that fetches so5Score for every player in a game
-    using field aliases (one request per game).
-    """
-    if not players:
-        return ""
-
-    aliases = []
-    for i, player in enumerate(players):
-        slug = player["slug"]
-        safe_alias = f"p{i}_{slug.replace('-', '_')}"
-        aliases.append(
-            f'{safe_alias}: so5Score(playerSlug: "{slug}") {{\n'
-            f'  score\n'
-            f'  player {{ displayName position }}\n'
-            f'}}'
+        resp = requests.post(
+            SORARE_GRAPHQL_URL,
+            json={"query": query, "variables": {"slug": fixture_slug}},
+            headers=headers,
+            timeout=30
         )
 
-    aliases_str = "\n".join(aliases)
-    return f"""
-query {{
-  so5 {{
-    so5Fixture(slug: "{fixture_slug}") {{
-      games {{
-        id
-        so5ScoreData: id
-        {aliases_str}
-      }}
-    }}
-  }}
-}}
-"""
+        if resp.status_code == 429:
+            print("   ⏳ Rate limit Sorare (429) — on attend 60 secondes...")
+            time.sleep(60)
+            return []
 
+        data = resp.json()
 
-def fetch_scores_for_game(fixture_slug: str, game_id: str, players: list) -> list:
-    """
-    Returns list of dicts {player, position, score, game_id} for
-    all players in the game who have a score.
-    """
-    if not players:
-        return []
+        if "errors" in data:
+            for err in data["errors"]:
+                msg = err.get('message', str(err))
+                print(f"   ⚠️  Erreur GraphQL : {msg}")
+                if "complexity" in msg.lower():
+                    print("   💡 Conseil : ajoute une SORARE_API_KEY dans Railway pour lever la limite")
+            return []
 
-    query = build_score_query(fixture_slug, game_id, players)
-    data = gql(query)
+        scores = []
+        fixture_data = data.get("data", {}).get("so5Fixture", {})
+        if not fixture_data:
+            return []
 
-    results = []
-    try:
-        games = data["so5"]["so5Fixture"]["games"]
-    except (KeyError, TypeError):
-        return []
+        leaderboards = fixture_data.get("so5Leaderboards", {}).get("nodes", [])
+        for lb in leaderboards:
+            competition_name = lb.get("displayName", "Unknown Competition")
+            rankings = lb.get("so5Rankings", {}).get("nodes", [])
 
-    # Find the game entry matching our game_id
-    target_game = None
-    for game_entry in games:
-        if game_entry.get("so5ScoreData") == game_id or game_entry.get("id") == game_id:
-            target_game = game_entry
-            break
-
-    if not target_game:
-        return []
-
-    for i, player in enumerate(players):
-        slug = player["slug"]
-        safe_alias = f"p{i}_{slug.replace('-', '_')}"
-        score_data = target_game.get(safe_alias)
-        if score_data and score_data.get("score") is not None:
-            results.append({
-                "player": score_data["player"]["displayName"],
-                "position": score_data["player"].get("position", ""),
-                "score": score_data["score"],
-                "game_id": game_id,
-                "slug": slug,
-            })
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Twitter
-# ---------------------------------------------------------------------------
-
-def build_twitter_client() -> tweepy.Client:
-    return tweepy.Client(
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET,
-    )
-
-
-def post_tweet(client: tweepy.Client, text: str) -> bool:
-    try:
-        response = client.create_tweet(text=text)
-        tweet_id = response.data["id"]
-        logger.info("Tweet posted (id=%s): %s", tweet_id, text)
-        return True
-    except tweepy.TweepyException as exc:
-        logger.error("Failed to post tweet: %s", exc)
-        return False
-
-
-def build_tweet(entry: dict, fixture: dict, game: dict) -> str:
-    player = entry["player"]
-    score = entry["score"]
-    home = game["homeTeam"]["name"]
-    away = game["awayTeam"]["name"]
-    gw = fixture.get("gameWeek", "")
-    gw_label = f" | GW{gw}" if gw else ""
-    return (
-        f"SORARE ALERT: {player} just scored {score:.1f} pts{gw_label}! "
-        f"{home} vs {away} #Sorare #Fantasy"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Polling loop
-# ---------------------------------------------------------------------------
-
-def run_poll(twitter_client: tweepy.Client, alerted_keys: set) -> None:
-    logger.info("Polling Sorare API...")
-
-    fixtures = fetch_recent_fixtures()
-    if not fixtures:
-        logger.warning("No fixtures found.")
-        return
-
-    # Use only the two most recent fixtures (current + last completed)
-    for fixture in fixtures[:2]:
-        fixture_slug = fixture["slug"]
-        game_week = fixture.get("gameWeek")
-        games = fixture.get("games", [])
-        logger.info(
-            "Checking fixture: %s (GW%s) — %d games",
-            fixture_slug, game_week, len(games),
-        )
-
-        for game in games:
-            game_id = game["id"]
-            players = fetch_players_for_game(game_id)
-            if not players:
-                continue
-
-            scores = fetch_scores_for_game(fixture_slug, game_id, players)
-
-            for entry in scores:
-                if entry["score"] < SCORE_THRESHOLD:
+            for ranking in rankings:
+                lineup = ranking.get("so5Lineup")
+                if not lineup:
                     continue
+                projections = lineup.get("so5AppearanceProjections", [])
+                for proj in projections:
+                    player_score = proj.get("score")
+                    player_name = proj.get("player", {}).get("displayName", "Unknown")
 
-                # Deduplicate alerts: (player_slug, fixture_slug)
-                alert_key = (entry["slug"], fixture_slug)
-                if alert_key in alerted_keys:
-                    continue
+                    if player_score is not None and float(player_score) >= TARGET_SCORE:
+                        score_id = f"{fixture_slug}_{player_name}_{player_score}"
+                        scores.append({
+                            "player_name": player_name,
+                            "score": float(player_score),
+                            "competition": competition_name,
+                            "fixture_slug": fixture_slug,
+                            "score_id": score_id,
+                        })
 
-                logger.info(
-                    "Player %s scored %.1f — posting tweet!",
-                    entry["player"], entry["score"],
-                )
-                tweet_text = build_tweet(entry, fixture, game)
-                success = post_tweet(twitter_client, tweet_text)
-                if success:
-                    alerted_keys.add(alert_key)
+        return scores
+
+    except Exception as e:
+        print(f"   ❌ Erreur réseau : {e}")
+        return []
 
 
-def main() -> None:
-    logger.info(
-        "Sorare Score Monitor started. Threshold: %d pts | Interval: %d min.",
-        SCORE_THRESHOLD,
-        POLL_INTERVAL_SECONDS // 60,
-    )
-    twitter_client = build_twitter_client()
-    alerted_keys: set = set()
+def fetch_recent_scores():
+    """Point d'entrée principal pour récupérer les scores."""
+    headers = build_headers()
+
+    fixture_slug = fetch_current_fixture_slug(headers)
+    if not fixture_slug:
+        print("   ⚠️  Impossible de récupérer la fixture en cours")
+        return []
+
+    # Petite pause entre les deux requêtes pour éviter le rate-limit
+    time.sleep(3)
+
+    scores = fetch_scores_for_fixture(fixture_slug, headers)
+    return scores
+
+
+# ============================================================
+# BOUCLE PRINCIPALE
+# ============================================================
+
+def run_bot():
+    """Lance le bot en boucle infinie."""
+    print("=" * 55)
+    print("🤖  Sorare Score Alert Bot — démarré !")
+    print(f"    Score cible     : {TARGET_SCORE}")
+    print(f"    Intervalle      : {CHECK_INTERVAL // 60} minutes")
+    print(f"    Clé Sorare      : {'✅ configurée' if SORARE_API_KEY else '❌ absente (limite 500)'}")
+    print(f"    Clés Twitter    : {'✅ configurées' if X_API_KEY else '❌ absentes'}")
+    print("=" * 55)
+    print()
+
+    twitter_client = get_twitter_client()
+    already_posted = load_already_posted()
+    iteration = 0
 
     while True:
-        try:
-            run_poll(twitter_client, alerted_keys)
-        except Exception as exc:
-            logger.error("Unexpected error in poll cycle: %s", exc, exc_info=True)
+        iteration += 1
+        now = datetime.now().strftime('%H:%M:%S')
+        print(f"[{now}] ── Check #{iteration} ──────────────────────────")
 
-        logger.info("Sleeping %d seconds until next poll...", POLL_INTERVAL_SECONDS)
-        time.sleep(POLL_INTERVAL_SECONDS)
+        scores = fetch_recent_scores()
 
+        new_scores = [s for s in scores if s["score_id"] not in already_posted]
+
+        if not new_scores:
+            if scores:
+                print(f"   {len(scores)} score(s) ≥ {TARGET_SCORE} trouvé(s) mais déjà tweeté(s)")
+            else:
+                print(f"   Aucun score ≥ {TARGET_SCORE} trouvé pour le moment")
+        else:
+            print(f"   🎉 {len(new_scores)} nouveau(x) score(s) parfait(s) !")
+
+        for score_data in new_scores:
+            template = random.choice(TWEET_TEMPLATES)
+            tweet_text = template.format(
+                player=score_data["player_name"],
+                score=int(score_data["score"]),
+                competition=score_data["competition"],
+                player_hashtag=make_player_hashtag(score_data["player_name"])
+            )
+
+            print(f"   → Tweet pour {score_data['player_name']} ({score_data['score']})")
+            success = post_tweet(twitter_client, tweet_text)
+
+            if success:
+                already_posted.add(score_data["score_id"])
+                save_already_posted(already_posted)
+
+            # Pause entre tweets pour ne pas spammer
+            time.sleep(5)
+
+        print(f"   Prochaine vérification dans {CHECK_INTERVAL // 60} min...")
+        time.sleep(CHECK_INTERVAL)
+
+
+# ============================================================
+# POINT D'ENTRÉE
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    run_bot()
