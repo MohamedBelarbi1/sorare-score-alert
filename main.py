@@ -103,32 +103,64 @@ def post_tweet(client, message):
 
 # ============================================================
 # SORARE API
+# Les fixtures So5 sont accessibles via so5 { ... } ou football { ... }
 # ============================================================
 
 def fetch_current_fixture_slug(headers):
     """
-    Récupère le slug de la fixture actuelle via currentSo5Fixture.
-    On utilise 'currentSo5Fixture' qui est la query racine correcte.
+    Récupère le slug de la fixture actuelle.
+    On passe par so5 { currentFixture } qui est la query racine correcte.
     """
-    # On tente d'abord currentSo5Fixture, puis on essaie d'autres variantes
     queries_to_try = [
-        # Tentative 1 : currentSo5Fixture (fixture en cours)
-        ("currentSo5Fixture", """
+        # Tentative 1 : so5 > currentFixture
+        ("so5.currentFixture", """
         query {
-          currentSo5Fixture {
-            slug
-            gameWeek
-            displayName
+          so5 {
+            currentFixture {
+              slug
+              gameWeek
+              displayName
+            }
           }
         }
         """),
-        # Tentative 2 : so5Fixture avec "current"
-        ("so5Fixture_next", """
+        # Tentative 2 : football > currentFixture
+        ("football.currentFixture", """
         query {
-          so5Fixture(slug: "current") {
-            slug
-            gameWeek
-            displayName
+          football {
+            currentFixture {
+              slug
+              gameWeek
+              displayName
+            }
+          }
+        }
+        """),
+        # Tentative 3 : so5 > fixtures (liste)
+        ("so5.fixtures", """
+        query {
+          so5 {
+            fixtures(first: 1) {
+              nodes {
+                slug
+                gameWeek
+                displayName
+              }
+            }
+          }
+        }
+        """),
+        # Tentative 4 : football > so5Fixtures
+        ("football.so5Fixtures", """
+        query {
+          football {
+            so5Fixtures(first: 1) {
+              nodes {
+                slug
+                gameWeek
+                displayName
+              }
+            }
           }
         }
         """),
@@ -151,124 +183,173 @@ def fetch_current_fixture_slug(headers):
             data = resp.json()
 
             if "errors" in data:
-                errs = data["errors"]
-                for e in errs:
-                    print(f"   ⚠️  [{name}] {e.get('message', e)}")
+                for e in data["errors"]:
+                    print(f"   ⚠️  [{name}] {e.get('message', str(e))[:120]}")
                 continue
 
-            # Cherche dans les données
+            # Cherche le fixture dans la réponse
             d = data.get("data", {})
-            fixture = d.get("currentSo5Fixture") or d.get("so5Fixture")
+            fixture = None
+
+            # Chemin so5.currentFixture ou football.currentFixture
+            for root_key in ["so5", "football"]:
+                root = d.get(root_key, {})
+                if not root:
+                    continue
+                # currentFixture direct
+                if root.get("currentFixture"):
+                    fixture = root["currentFixture"]
+                    break
+                # fixtures.nodes[0]
+                if root.get("fixtures", {}).get("nodes"):
+                    fixture = root["fixtures"]["nodes"][0]
+                    break
+                # so5Fixtures.nodes[0]
+                if root.get("so5Fixtures", {}).get("nodes"):
+                    fixture = root["so5Fixtures"]["nodes"][0]
+                    break
+
             if fixture and fixture.get("slug"):
                 slug = fixture["slug"]
                 gw = fixture.get("gameWeek", "?")
-                name_display = fixture.get("displayName", slug)
-                print(f"   📅 Fixture : {name_display} (GW{gw}) — slug: {slug}")
+                display = fixture.get("displayName", slug)
+                print(f"   📅 [{name}] Fixture : {display} (GW{gw})")
                 return slug
 
         except Exception as e:
             print(f"   ❌ Erreur réseau [{name}] : {e}")
             continue
 
-    print("   ⚠️  Impossible de récupérer la fixture en cours")
+    print("   ⚠️  Impossible de récupérer la fixture — toutes les queries ont échoué")
     return None
 
 
 def fetch_scores_for_fixture(fixture_slug, headers):
     """
-    Récupère les scores >= TARGET_SCORE pour une fixture donnée.
-    Utilise orderedSo5ScoresByPosition avec minScore.
+    Récupère les scores >= TARGET_SCORE pour une fixture via node(id).
+    On utilise so5Fixture(slug) imbriqué dans so5 {}.
     """
-    query = """
-    query GetFixtureScores($slug: String!, $minScore: Int!) {
-      so5Fixture(slug: $slug) {
-        slug
-        displayName
-        orderedSo5ScoresByPosition(first: 50, minScore: $minScore) {
-          nodes {
-            score
-            player {
+    queries_to_try = [
+        # Tentative 1 : so5 > fixture(slug)
+        ("so5.fixture", """
+        query GetScores($slug: String!, $minScore: Int!) {
+          so5 {
+            fixture(slug: $slug) {
+              slug
               displayName
-            }
-            so5Fixture {
-              displayName
+              orderedSo5ScoresByPosition(first: 50, minScore: $minScore) {
+                nodes {
+                  score
+                  player {
+                    displayName
+                  }
+                }
+              }
             }
           }
         }
-      }
-    }
-    """
-
-    try:
-        resp = requests.post(
-            SORARE_GRAPHQL_URL,
-            json={
-                "query": query,
-                "variables": {
-                    "slug": fixture_slug,
-                    "minScore": TARGET_SCORE
+        """),
+        # Tentative 2 : football > so5Fixture(slug)
+        ("football.so5Fixture", """
+        query GetScores($slug: String!, $minScore: Int!) {
+          football {
+            so5Fixture(slug: $slug) {
+              slug
+              displayName
+              orderedSo5ScoresByPosition(first: 50, minScore: $minScore) {
+                nodes {
+                  score
+                  player {
+                    displayName
+                  }
                 }
-            },
-            headers=headers,
-            timeout=30
-        )
+              }
+            }
+          }
+        }
+        """),
+    ]
 
-        if resp.status_code == 429:
-            print("   ⏳ Rate limit (429) — attente 60s...")
-            time.sleep(60)
-            return []
+    for name, query in queries_to_try:
+        try:
+            resp = requests.post(
+                SORARE_GRAPHQL_URL,
+                json={
+                    "query": query,
+                    "variables": {
+                        "slug": fixture_slug,
+                        "minScore": TARGET_SCORE
+                    }
+                },
+                headers=headers,
+                timeout=30
+            )
 
-        data = resp.json()
+            if resp.status_code == 429:
+                print("   ⏳ Rate limit (429) — attente 60s...")
+                time.sleep(60)
+                return []
 
-        if "errors" in data:
-            for err in data["errors"]:
-                msg = err.get('message', str(err))
-                print(f"   ⚠️  Erreur GraphQL : {msg}")
-            return []
+            data = resp.json()
 
-        scores = []
-        fixture_data = data.get("data", {}).get("so5Fixture", {})
-        if not fixture_data:
-            return []
+            if "errors" in data:
+                for err in data["errors"]:
+                    print(f"   ⚠️  [{name}] {err.get('message', str(err))[:120]}")
+                continue
 
-        competition_name = fixture_data.get("displayName", "Sorare")
-        nodes = fixture_data.get("orderedSo5ScoresByPosition", {}).get("nodes", [])
+            # Cherche les données dans so5 ou football
+            d = data.get("data", {})
+            fixture_data = None
+            for root_key in ["so5", "football"]:
+                root = d.get(root_key, {})
+                if root.get("fixture"):
+                    fixture_data = root["fixture"]
+                    break
+                if root.get("so5Fixture"):
+                    fixture_data = root["so5Fixture"]
+                    break
 
-        for node in nodes:
-            player_score = node.get("score")
-            player_name = node.get("player", {}).get("displayName", "Unknown")
+            if not fixture_data:
+                continue
 
-            if player_score is not None and float(player_score) >= TARGET_SCORE:
-                score_id = f"{fixture_slug}_{player_name}_{player_score}"
-                scores.append({
-                    "player_name": player_name,
-                    "score": float(player_score),
-                    "competition": competition_name,
-                    "fixture_slug": fixture_slug,
-                    "score_id": score_id,
-                })
+            competition_name = fixture_data.get("displayName", "Sorare")
+            nodes = fixture_data.get("orderedSo5ScoresByPosition", {}).get("nodes", [])
+            scores = []
 
-        return scores
+            for node in nodes:
+                player_score = node.get("score")
+                player_name = node.get("player", {}).get("displayName", "Unknown")
+                if player_score is not None and float(player_score) >= TARGET_SCORE:
+                    score_id = f"{fixture_slug}_{player_name}_{player_score}"
+                    scores.append({
+                        "player_name": player_name,
+                        "score": float(player_score),
+                        "competition": competition_name,
+                        "fixture_slug": fixture_slug,
+                        "score_id": score_id,
+                    })
 
-    except Exception as e:
-        print(f"   ❌ Erreur réseau : {e}")
-        return []
+            print(f"   ✅ [{name}] {len(scores)} score(s) >= {TARGET_SCORE}")
+            return scores
+
+        except Exception as e:
+            print(f"   ❌ Erreur réseau [{name}] : {e}")
+            continue
+
+    print("   ⚠️  Impossible de récupérer les scores")
+    return []
 
 
 def fetch_recent_scores():
     headers = build_headers()
-    key_status = "✅ clé API Sorare active" if SORARE_API_KEY else "⚠️  pas de clé API (limite 500)"
-    print(f"   {key_status}")
+    print(f"   {'✅ clé API Sorare active' if SORARE_API_KEY else '⚠️  pas de clé API'}")
 
     fixture_slug = fetch_current_fixture_slug(headers)
     if not fixture_slug:
         return []
 
-    time.sleep(3)  # pause anti rate-limit entre les deux requêtes
-
-    scores = fetch_scores_for_fixture(fixture_slug, headers)
-    print(f"   {len(scores)} score(s) >= {TARGET_SCORE} trouvé(s)")
-    return scores
+    time.sleep(3)
+    return fetch_scores_for_fixture(fixture_slug, headers)
 
 
 # ============================================================
@@ -299,6 +380,8 @@ def run_bot():
         if not new_scores:
             if scores:
                 print(f"   Tous les scores déjà tweetés")
+            else:
+                print(f"   Aucun score >= {TARGET_SCORE} pour le moment")
         else:
             print(f"   🎉 {len(new_scores)} nouveau(x) score(s) à tweeter !")
 
@@ -310,14 +393,11 @@ def run_bot():
                 competition=score_data["competition"],
                 player_hashtag=make_player_hashtag(score_data["player_name"])
             )
-
             print(f"   → {score_data['player_name']} ({score_data['score']})")
             success = post_tweet(twitter_client, tweet_text)
-
             if success:
                 already_posted.add(score_data["score_id"])
                 save_already_posted(already_posted)
-
             time.sleep(5)
 
         print(f"   💤 Prochain check dans {CHECK_INTERVAL // 60} min...")
