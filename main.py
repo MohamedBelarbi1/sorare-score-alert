@@ -136,15 +136,18 @@ def fetch_current_fixture_slug(headers):
           }
         }
         """),
-        # Tentative 3 : so5 > so5Fixtures (liste)
-        ("so5.so5Fixtures", """
+        # Tentative 3 : so5 > so5Fixtures avec filtre "live" (fixture en cours)
+        ("so5.so5Fixtures.live", """
         query {
           so5 {
-            so5Fixtures(first: 1) {
+            so5Fixtures(first: 5) {
               nodes {
                 slug
                 gameWeek
                 displayName
+                startDate
+                endDate
+                live
               }
             }
           }
@@ -181,7 +184,26 @@ def fetch_current_fixture_slug(headers):
             if root.get("currentFixture"):
                 fixture = root["currentFixture"]
             elif root.get("so5Fixtures", {}).get("nodes"):
-                fixture = root["so5Fixtures"]["nodes"][0]
+                nodes = root["so5Fixtures"]["nodes"]
+                now = datetime.utcnow().isoformat() + "Z"
+                # Priorité 1 : fixture marquée live
+                for n in nodes:
+                    if n.get("live"):
+                        fixture = n
+                        break
+                # Priorité 2 : fixture dont startDate <= maintenant <= endDate
+                if not fixture:
+                    for n in nodes:
+                        start = n.get("startDate", "")
+                        end = n.get("endDate", "")
+                        if start and end and start <= now <= end:
+                            fixture = n
+                            break
+                # Priorité 3 : la première dont startDate est dans le passé
+                if not fixture:
+                    past = [n for n in nodes if n.get("startDate", "") <= now]
+                    if past:
+                        fixture = past[-1]  # la plus récente dans le passé
 
             if fixture and fixture.get("slug"):
                 slug = fixture["slug"]
