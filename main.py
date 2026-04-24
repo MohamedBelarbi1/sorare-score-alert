@@ -18,11 +18,17 @@ from datetime import datetime
 # CONFIG — Variables d'environnement Railway
 # ============================================================
 
-# Clés X (Twitter) — accepte les deux formats de noms
+# Clés X (Twitter) OAuth 1.0a
 X_API_KEY             = os.environ.get("X_API_KEY") or os.environ.get("TWITTER_API_KEY", "")
 X_API_SECRET          = os.environ.get("X_API_SECRET") or os.environ.get("TWITTER_API_SECRET", "")
 X_ACCESS_TOKEN        = os.environ.get("X_ACCESS_TOKEN") or os.environ.get("TWITTER_ACCESS_TOKEN", "")
 X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET") or os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "")
+
+# Clés X (Twitter) OAuth 2.0 (plan Free)
+X_OAUTH2_ACCESS_TOKEN  = os.environ.get("X_OAUTH2_ACCESS_TOKEN", "")
+X_OAUTH2_REFRESH_TOKEN = os.environ.get("X_OAUTH2_REFRESH_TOKEN", "")
+X_CLIENT_ID            = os.environ.get("X_CLIENT_ID") or os.environ.get("TWITTER_API_KEY", "")
+X_CLIENT_SECRET        = os.environ.get("X_CLIENT_SECRET") or os.environ.get("TWITTER_API_SECRET", "")
 
 # Clé API Sorare
 SORARE_API_KEY = os.environ.get("SORARE_API_KEY", "")
@@ -80,15 +86,23 @@ def build_headers():
 # ============================================================
 
 def get_twitter_client():
-    if not all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]):
-        print("❌ Clés Twitter manquantes dans les variables d'environnement Railway")
-        return None
-    return tweepy.Client(
-        consumer_key=X_API_KEY,
-        consumer_secret=X_API_SECRET,
-        access_token=X_ACCESS_TOKEN,
-        access_token_secret=X_ACCESS_TOKEN_SECRET
-    )
+    # Priorité 1 : OAuth 2.0 (plan Free — 1500 tweets/mois)
+    if X_OAUTH2_ACCESS_TOKEN:
+        print("   🔑 Twitter : OAuth 2.0 (plan Free)")
+        return tweepy.Client(access_token=X_OAUTH2_ACCESS_TOKEN)
+
+    # Priorité 2 : OAuth 1.0a (plan Basic payant)
+    if all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET]):
+        print("   🔑 Twitter : OAuth 1.0a")
+        return tweepy.Client(
+            consumer_key=X_API_KEY,
+            consumer_secret=X_API_SECRET,
+            access_token=X_ACCESS_TOKEN,
+            access_token_secret=X_ACCESS_TOKEN_SECRET
+        )
+
+    print("❌ Aucune clé Twitter configurée dans Railway")
+    return None
 
 def post_tweet(client, message):
     if not client:
