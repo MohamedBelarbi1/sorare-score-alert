@@ -108,7 +108,8 @@ def post_tweet(client, message):
     if not client:
         return False
     try:
-        response = client.create_tweet(text=message)
+        # user_auth=False force l'utilisation d'OAuth 2.0 Bearer Token
+        response = client.create_tweet(text=message, user_auth=False)
         print(f"   ✅ Tweet posté ! ID: {response.data['id']}")
         return True
     except tweepy.TweepyException as e:
